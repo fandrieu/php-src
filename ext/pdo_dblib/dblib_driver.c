@@ -295,6 +295,54 @@ static int dblib_set_attr(pdo_dbh_t *dbh, zend_long attr, zval *val)
 	}
 }
 
+static int dblib_get_tdsver_name(zval *return_value, int tdsver)
+{
+	switch (tdsver) {
+		case DBTDS_UNKNOWN:
+			ZVAL_STRING(return_value, "unknown");
+			break;
+		case DBTDS_2_0:
+			ZVAL_STRING(return_value, "2.0");
+			break;
+		case DBTDS_3_4:
+			ZVAL_STRING(return_value, "3.4");
+			break;
+		case DBTDS_4_0:
+			ZVAL_STRING(return_value, "4.0");
+			break;
+		case DBTDS_4_2:
+			ZVAL_STRING(return_value, "4.2");
+			break;
+		case DBTDS_4_6:
+			ZVAL_STRING(return_value, "4.6");
+			break;
+		case DBTDS_4_9_5:
+			ZVAL_STRING(return_value, "4.9");
+			break;
+		case DBTDS_5_0:
+			ZVAL_STRING(return_value, "5.0");
+			break;
+		case DBTDS_7_0:
+			ZVAL_STRING(return_value, "7.0");
+			break;
+		case DBTDS_7_1:
+			ZVAL_STRING(return_value, "7.1");
+			break;
+		case DBTDS_7_2:
+			ZVAL_STRING(return_value, "7.2");
+			break;
+		case DBTDS_7_3:
+			ZVAL_STRING(return_value, "7.3");
+			break;
+		case DBTDS_7_4:
+			ZVAL_STRING(return_value, "7.4");
+			break;
+		default:
+			return 0;
+	}
+	return 1;
+}
+
 static int dblib_get_attribute(pdo_dbh_t *dbh, zend_long attr, zval *return_value)
 {
 	pdo_dblib_db_handle *H = (pdo_dblib_db_handle *)dbh->driver_data;
@@ -315,6 +363,10 @@ static int dblib_get_attribute(pdo_dbh_t *dbh, zend_long attr, zval *return_valu
 
 		case PDO_DBLIB_ATTR_VERSION:
 			ZVAL_STRING(return_value, dbversion());
+			break;
+
+		case PDO_DBLIB_ATTR_TDSVERSION:
+			dblib_get_tdsver_name(return_value, dbtds(H->link));
 			break;
 
 		case PDO_DBLIB_ATTR_SKIP_EMPTY_ROWSETS:
