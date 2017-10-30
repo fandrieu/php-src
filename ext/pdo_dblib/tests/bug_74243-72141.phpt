@@ -43,6 +43,15 @@ $stmt = $db->query($sql);
 var_dump($stmt->fetch(PDO::FETCH_ASSOC));
 $stmt->closeCursor();
 
+$sql = "SELECT convert(datetime2, '10231017 10:22:44.1355318') AS [d]";
+$stmt = $db->query($sql);
+var_dump($stmt->fetch(PDO::FETCH_ASSOC));
+$stmt->closeCursor();
+$db->setAttribute(PDO::DBLIB_ATTR_DATETIME_CONVERT, 1);
+$stmt = $db->query($sql);
+var_dump($stmt->fetch(PDO::FETCH_ASSOC));
+$stmt->closeCursor();
+
 $db->setAttribute(PDO::DBLIB_ATTR_DATETIME_FORMAT, "");
 var_dump($db->getAttribute(PDO::DBLIB_ATTR_DATETIME_FORMAT));
 $db->setAttribute(PDO::DBLIB_ATTR_DATETIME_FORMAT, "test");
@@ -77,6 +86,14 @@ array(1) {
 array(1) {
   ["d"]=>
   string(26) "2017-10-27 136667 10:22:44"
+}
+array(1) {
+  ["d"]=>
+  string(26) "1023-10-17 135532 10:22:44"
+}
+array(1) {
+  ["d"]=>
+  string(30) "Oct 17 1023 10:22:44:1355318AM"
 }
 NULL
 string(4) "test"

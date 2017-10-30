@@ -402,7 +402,10 @@ static int pdo_dblib_stmt_get_col(pdo_stmt_t *stmt, int colno, char **ptr,
 					break;
 				}
 				case SQLDATETIME:
-				case SQLDATETIM4: {
+				case SQLDATETIM4:
+				case SQLMSDATE:
+				case SQLMSTIME:
+				case SQLMSDATETIME2: {
 					if (H->datetime_convert) {
 						tmp_data_len = 63; /* hardcoded maximum length in freetds */
 						tmp_data = emalloc(tmp_data_len);
