@@ -33,6 +33,8 @@
 #include "php_pdo_dblib_int.h"
 #include "zend_exceptions.h"
 
+
+#define DBLIB_MEMCPY_WALK(dst, src, len) if (memcpy(dst, src, len)) dst += len
 static int pdo_dblib_rpc_execute(pdo_stmt_t *stmt);
 
 
@@ -117,7 +119,6 @@ static int pdo_dblib_stmt_dtor(pdo_stmt_t *stmt)
 
 	if (rpc) {
 		if (rpc->params) {
-			zval_ptr_dtor(rpc->params);
 			efree(rpc->params);
 		}
 		efree(rpc);
@@ -810,28 +811,66 @@ static int pdo_dblib_rpc_param_hook(pdo_stmt_t *stmt, struct pdo_bound_param_dat
 	return 1;
 };
 
-static int pdo_dblib_rpc_execsql_prepare(pdo_stmt_t *stmt, struct pdo_bound_param_data *param)
+
+static int pdo_dblib_rpc_execsql_build_stmt(pdo_stmt_t *stmt)
+{
+	char *query = stmt->query_string;
+	size_t len = stmt->query_stringlen;
+	char *query_fix = emalloc(len);
+	char *tmp;
+	int quote = 0;
+	int positional = 0;
+	int numlen;
+
+	strncpy(query_fix, query, len);
+
+	for (size_t i=0; i<len; i++) {
+		if (query_fix[i] == '\'') {
+			quote = !quote;
+			continue;
+		}
+		if (!quote && query_fix[i] == ':') {
+			query_fix[i] = '@';
+			continue;
+		}
+		if (!quote && query_fix[i] == '?') {
+			tmp = emalloc(len + 10 + 1);
+			memcpy(tmp, query_fix, i);
+			numlen = sprintf(tmp + i, "@%d", ++positional);
+			memcpy(tmp + i + numlen, query_fix + i + 1, len - i - 1);
+			len += numlen - 1;
+			i += numlen - 1;
+			efree(query_fix);
+			query_fix = tmp;
+		}
+	}
+
+	stmt->active_query_string = query_fix;
+	stmt->active_query_stringlen = len;
+
+	return 1;
+}
+
+static int pdo_dblib_rpc_execsql_build_params(pdo_stmt_t *stmt, struct pdo_bound_param_data *param)
 {
 	pdo_dblib_stmt *S = (pdo_dblib_stmt*)stmt->driver_data;
 	pdo_dblib_rpc_stmt *rpc = S->rpc;
 	pdo_dblib_param *P = (pdo_dblib_param*)param->driver_data;
-	zval *parameter;
-	char *name, *type, *buf;
-	size_t name_len, params_len, type_len, buf_len;
-	int sep;
+	char *name, *type, *buf, *tmp;
+	size_t namelen, typelen, buflen;
 
 	if (P->retval) {
 		return 1;
 	}
 
 	if (param->paramno != -1) {
-		name_len = spprintf(&name, 10, "@%d", param->paramno + 1);
+		namelen = spprintf(&name, 10, "@%d", param->paramno + 1);
 	} else {
 		name = ZSTR_VAL(param->name);
-		name_len = ZSTR_LEN(param->name);
+		namelen = ZSTR_LEN(param->name);
 	}
 
-	/* prepare string: ...,@param varchar(8000) */
+	/* prepare string: ...,@param varchar(8000) out */
 	switch(P->type) {
 		case SQLFLT8:
 			type = " float";
@@ -848,21 +887,28 @@ static int pdo_dblib_rpc_execsql_prepare(pdo_stmt_t *stmt, struct pdo_bound_para
 		default:
 			type = " varchar(8000)";
 	}
+	typelen = strlen(type);
 
-	params_len = Z_STRLEN_P(rpc->params);
-	type_len = strlen(type) + 1;
-	buf_len = params_len + sep + name_len + type_len;
-	buf = emalloc(buf_len);
-	if (params_len) {
-		strncpy(buf, Z_STRVAL_P(rpc->params), params_len);
-		*(buf + params_len - 1) = ',';
+	buflen = rpc->paramslen + namelen + typelen;
+	if (rpc->paramslen) buflen++;
+	if (P->output) buflen += 4;
+	tmp = buf = emalloc(buflen + 1);
+
+	if (rpc->paramslen) {
+		DBLIB_MEMCPY_WALK(tmp, rpc->params, rpc->paramslen);
+		DBLIB_MEMCPY_WALK(tmp, ",", 1);
+		efree(rpc->params);
 	}
-	strncpy(buf + params_len + sep, name, name_len);
-	strncpy(buf + params_len + sep + name_len, type, type_len);
+	DBLIB_MEMCPY_WALK(tmp, name, namelen);
+	DBLIB_MEMCPY_WALK(tmp, type, typelen);
+	if (P->output) {
+		DBLIB_MEMCPY_WALK(tmp, " out", 4);
+	}
+	*tmp = 0;
 
-	ZVAL_STRINGL(rpc->params, buf, buf_len);
+	rpc->params = buf;
+	rpc->paramslen = buflen;
 
-	efree(buf);
 	if (param->paramno != -1) {
 		efree(name);
 	}
@@ -875,20 +921,23 @@ static int pdo_dblib_rpc_execsql_bind(pdo_stmt_t *stmt)
 	pdo_dblib_stmt *S = (pdo_dblib_stmt*)stmt->driver_data;
 	pdo_dblib_rpc_stmt *rpc = S->rpc;
 	struct pdo_bound_param_data *param;
-	struct pdo_bound_param_data execprm;
-	pdo_dblib_param execprm_data;
+	struct pdo_bound_param_data prm;
+	pdo_dblib_param data;
 
 	/* init temp param */
-	memset(&execprm, 0, sizeof(execprm));
-	execprm.driver_data = &execprm_data;
-	execprm_data.type = SQLVARCHAR;
-	execprm_data.output = 0;
-	execprm_data.retval = 0;
+	memset(&prm, 0, sizeof(prm));
+	prm.driver_data = &data;
+	data.type = SQLVARCHAR;
+	data.output = 0;
+	data.retval = 0;
 
-	/* bind "statement" */
-	execprm_data.value = (LPBYTE)stmt->query_string;
-	execprm_data.valuelen = stmt->query_stringlen;
-	if (!pdo_dblib_rpc_param_hook(stmt, &execprm, PDO_PARAM_EVT_EXEC_PRE, 1)) {
+	/* prepare & bind "statement" */
+	if (!stmt->executed) {
+		pdo_dblib_rpc_execsql_build_stmt(stmt);
+	}
+	data.value = (LPBYTE)stmt->active_query_string;
+	data.valuelen = stmt->active_query_stringlen;
+	if (!pdo_dblib_rpc_param_hook(stmt, &prm, PDO_PARAM_EVT_EXEC_PRE, 1)) {
 		return 0;
 	}
 
@@ -897,14 +946,18 @@ static int pdo_dblib_rpc_execsql_bind(pdo_stmt_t *stmt)
 		return 1;
 	}
 
-	ZVAL_STRING(rpc->params, "");
+	if (rpc->params) {
+		efree(rpc->params);
+		rpc->params = NULL;
+	}
+	rpc->paramslen = 0;
 	ZEND_HASH_FOREACH_PTR(stmt->bound_params, param) {
-		pdo_dblib_rpc_execsql_prepare(stmt, param);
+		pdo_dblib_rpc_execsql_build_params(stmt, param);
 	} ZEND_HASH_FOREACH_END();
 
-	execprm_data.value = (LPBYTE)Z_STRVAL_P(rpc->params);
-	execprm_data.valuelen = Z_STRLEN_P(rpc->params);
-	if (!pdo_dblib_rpc_param_hook(stmt, &execprm, PDO_PARAM_EVT_EXEC_PRE, 1)) {
+	data.value = (LPBYTE)rpc->params;
+	data.valuelen = rpc->paramslen;
+	if (!pdo_dblib_rpc_param_hook(stmt, &prm, PDO_PARAM_EVT_EXEC_PRE, 1)) {
 		return 0;
 	}
 

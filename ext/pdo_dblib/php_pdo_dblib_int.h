@@ -136,7 +136,8 @@ typedef struct {
 	unsigned int return_count;
 	/* rpc_execsql */
 	unsigned execsql:1;
-	zval *params;
+	char *params;
+	size_t paramslen;
 } pdo_dblib_rpc_stmt;
 
 typedef struct {

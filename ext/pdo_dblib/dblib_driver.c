@@ -125,8 +125,6 @@ static int dblib_handle_preparer(pdo_dbh_t *dbh, const char *sql, size_t sql_len
 
 		if (H->rpc_execsql) {
 			rpc->execsql = 1;
-
-			rpc->params = emalloc(sizeof(zval));
 		}
 	}
 
