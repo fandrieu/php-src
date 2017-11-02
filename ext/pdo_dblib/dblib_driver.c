@@ -112,13 +112,22 @@ static int dblib_handle_preparer(pdo_dbh_t *dbh, const char *sql, size_t sql_len
 	S->err.sqlstate = stmt->error_code;
 	S->rpc = NULL;
 
-	if (pdo_attr_lval(driver_options, PDO_DBLIB_ATTR_RPC, 0)) {
+	if (pdo_attr_lval(driver_options, PDO_DBLIB_ATTR_RPC, 0) || H->rpc_execsql) {
 		S->rpc = emalloc(sizeof(*rpc));
 		rpc = S->rpc;
 		rpc->return_count = 0;
+		rpc->execsql = 0;
+		rpc->params = NULL;
+
 		rpc->skip_results = pdo_attr_lval(driver_options, PDO_DBLIB_ATTR_RPC_SKIP_RESULTS, 0);
 
 		stmt->supports_placeholders = PDO_PLACEHOLDER_NAMED|PDO_PLACEHOLDER_POSITIONAL;
+
+		if (H->rpc_execsql) {
+			rpc->execsql = 1;
+
+			rpc->params = emalloc(sizeof(zval));
+		}
 	}
 
 	return 1;
@@ -303,6 +312,8 @@ static int dblib_set_attr(pdo_dbh_t *dbh, zend_long attr, zval *val)
 			return 1;
 		case PDO_DBLIB_ATTR_DATETIME_CONVERT:
 			H->datetime_convert = zval_get_long(val);
+		case PDO_ATTR_EMULATE_PREPARES:
+			H->rpc_execsql = !zval_is_true(val);
 			return 1;
 		default:
 			return 0;
@@ -386,8 +397,7 @@ static int dblib_get_attribute(pdo_dbh_t *dbh, zend_long attr, zval *return_valu
 			break;
 
 		case PDO_ATTR_EMULATE_PREPARES:
-			/* this is the only option available, but expose it so common tests and whatever else can introspect */
-			ZVAL_TRUE(return_value);
+			ZVAL_BOOL(return_value, !H->rpc_execsql);
 			break;
 
 		case PDO_DBLIB_ATTR_STRINGIFY_UNIQUEIDENTIFIER:
@@ -485,6 +495,7 @@ static int pdo_dblib_handle_factory(pdo_dbh_t *dbh, zval *driver_options)
 	H->stringify_uniqueidentifier = 0;
 	H->skip_empty_rowsets = 0;
 	H->datetime_convert = 0;
+	H->rpc_execsql = 0;
 
 	if (!H->login) {
 		goto cleanup;
@@ -509,6 +520,7 @@ static int pdo_dblib_handle_factory(pdo_dbh_t *dbh, zval *driver_options)
 		H->stringify_uniqueidentifier = pdo_attr_lval(driver_options, PDO_DBLIB_ATTR_STRINGIFY_UNIQUEIDENTIFIER, 0);
 		H->skip_empty_rowsets = pdo_attr_lval(driver_options, PDO_DBLIB_ATTR_SKIP_EMPTY_ROWSETS, 0);
 		H->datetime_convert = pdo_attr_lval(driver_options, PDO_DBLIB_ATTR_DATETIME_CONVERT, 0);
+		H->rpc_execsql = !pdo_attr_lval(driver_options, PDO_ATTR_EMULATE_PREPARES, 1);
 	}
 
 	DBERRHANDLE(H->login, (EHANDLEFUNC) pdo_dblib_error_handler);

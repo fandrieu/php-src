@@ -33,7 +33,7 @@
 #include "php_pdo_dblib_int.h"
 #include "zend_exceptions.h"
 
-static int pdo_dblib_rpc_exec(pdo_stmt_t *stmt);
+static int pdo_dblib_rpc_execute(pdo_stmt_t *stmt);
 
 
 /* {{{ pdo_dblib_get_field_name
@@ -113,9 +113,14 @@ static int pdo_dblib_stmt_cursor_closer(pdo_stmt_t *stmt)
 static int pdo_dblib_stmt_dtor(pdo_stmt_t *stmt)
 {
 	pdo_dblib_stmt *S = (pdo_dblib_stmt*)stmt->driver_data;
+	pdo_dblib_rpc_stmt *rpc = S->rpc;
 
-	if (S->rpc) {
-		efree(S->rpc);
+	if (rpc) {
+		if (rpc->params) {
+			zval_ptr_dtor(rpc->params);
+			efree(rpc->params);
+		}
+		efree(rpc);
 	}
 
 	pdo_dblib_err_dtor(&S->err);
@@ -188,7 +193,7 @@ static int pdo_dblib_stmt_execute(pdo_stmt_t *stmt)
 	pdo_dblib_stmt_cursor_closer(stmt);
 
 	if (S->rpc) {
-		if (!pdo_dblib_rpc_exec(stmt)) {
+		if (!pdo_dblib_rpc_execute(stmt)) {
 			return 0;
 		}
 
@@ -582,19 +587,6 @@ static int pdo_dblib_stmt_get_column_meta(pdo_stmt_t *stmt, zend_long colno, zva
 	return 1;
 }
 
-static int pdo_dblib_rpc_param_cmp(const void* a, const void* b)
-{
-	/* sort by paramno, pushing -1 at the end */
-	int a_no = ((struct pdo_bound_param_data *)Z_PTR(((Bucket *)a)->val))->paramno;
-	int b_no = ((struct pdo_bound_param_data *)Z_PTR(((Bucket *)b)->val))->paramno;
-
-	if (a_no == b_no) return 0;
-	if (a_no == -1) return 1;
-	if (b_no == -1) return -1;
-	if (a_no < b_no) return -1;
-	return 1;
-}
-
 static int pdo_dblib_rpc_param_hook(pdo_stmt_t *stmt, struct pdo_bound_param_data *param,
 	enum pdo_param_event event_type, int init_post)
 {
@@ -638,10 +630,13 @@ static int pdo_dblib_rpc_param_hook(pdo_stmt_t *stmt, struct pdo_bound_param_dat
 	/* ALLOC: init driver_data (+ sort?) */
 	if (event_type == PDO_PARAM_EVT_ALLOC) {
 
+		P = emalloc(sizeof(*P));
+		param->driver_data = P;
+		P->output = 0;
+		P->retval = 0;
+
 		if ((param->param_type & PDO_PARAM_INPUT_OUTPUT) == PDO_PARAM_INPUT_OUTPUT) {
-			P = emalloc(sizeof(*P));
-			param->driver_data = P;
-			P->retval = 0;
+			P->output = 1;
 
 			if (param_name && !strncmp(param_name, "@RETVAL", sizeof("@RETVAL")-1)) {
 				P->retval = 1;
@@ -656,17 +651,11 @@ static int pdo_dblib_rpc_param_hook(pdo_stmt_t *stmt, struct pdo_bound_param_dat
 	}
 
 
-	/* INIT_POST: prepare data & call dbrpcparam */
-	/*
-	 * dbrpcinit and dbrpcparam must be called must be called before each execution
-	 * instead of calling dbrpcparam in EXEC_PRE we trigger another event in exec, after calling dbrpcinit
-	 */
-	if (event_type == PDO_PARAM_EVT_EXEC_PRE && init_post) {
-		char *value = NULL;
-		int datalen = 0, status = 0;
-		long type = 0, maxlen = -1, zendtype = 0, pdotype = 0;
+	/* EXEC_PRE: prepare data */
+	if (event_type == PDO_PARAM_EVT_EXEC_PRE && !init_post) {
+		long zendtype = 0, pdotype = 0;
 
-		if (P && P->retval) {
+		if (P->retval) {
 			return 1;
 		}
 
@@ -692,32 +681,41 @@ static int pdo_dblib_rpc_param_hook(pdo_stmt_t *stmt, struct pdo_bound_param_dat
 		/* set rpc bind data */
 		switch(zendtype) {
 			case IS_NULL:
-				datalen = 0;
-				value = NULL;
-				type = SQLVARCHAR;
+				P->valuelen = 0;
+				P->value = NULL;
+				P->type = SQLVARCHAR;
 				break;
 			case IS_FALSE:
 			case IS_TRUE:
 			case _IS_BOOL:
-				datalen = -1;
-				value = (LPBYTE)(&Z_LVAL_P(parameter));
-				type = SQLINT1;
+				P->valuelen = -1;
+				P->value = (LPBYTE)(&Z_LVAL_P(parameter));
+				P->type = SQLINT1;
 				break;
 			case IS_LONG:
-				datalen = -1;
-				value = (LPBYTE)(&Z_LVAL_P(parameter));
+				P->valuelen = -1;
+				P->value = (LPBYTE)(&Z_LVAL_P(parameter));
 				/* TODO: smaller if possible */
-				type = SQLINT8;
+				P->type = SQLINT8;
 				break;
 			case IS_DOUBLE:
-				datalen = -1;
-				value = (LPBYTE)(&Z_DVAL_P(parameter));
-				type = SQLFLT8;
+				P->valuelen = -1;
+				P->value = (LPBYTE)(&Z_DVAL_P(parameter));
+				P->type = SQLFLT8;
 				break;
 			case IS_STRING:
-				datalen = Z_STRLEN_P(parameter);
-				value = Z_STRVAL_P(parameter);
-				type = datalen > 8000 ? SQLTEXT : SQLVARCHAR;
+				P->valuelen = Z_STRLEN_P(parameter);
+				P->value = Z_STRVAL_P(parameter);
+				if (P->valuelen > 8000) {
+					if (P->output && dbtds(H->link) < DBTDS_7_2) {
+						php_error_docref(NULL, E_WARNING, "Falling back to varchar(8000)");
+						P->type = SQLVARCHAR;
+					} else {
+						P->type = SQLTEXT;
+					}
+				} else {
+					P->type = SQLVARCHAR;
+				}
 				break;
 			/* TODO */
 			case IS_OBJECT:
@@ -728,25 +726,31 @@ static int pdo_dblib_rpc_param_hook(pdo_stmt_t *stmt, struct pdo_bound_param_dat
 				return 0;
 		}
 
-		if (P) {
-			status = DBRPCRETURN;
-			P->return_pos = rpc->return_count++;
-			if (type == SQLTEXT) {
-				if (dbtds(H->link) < DBTDS_7_2) {
-					php_error_docref(NULL, E_WARNING, "Falling back to varchar(8000)");
-					type = SQLVARCHAR;
-				}
-				maxlen = datalen;
-			} else if (type == SQLVARCHAR) {
-				maxlen = 8000;
-			}
+		return 1;
+	}
+
+
+	/* INIT_POST: call dbrpcparam */
+	/*
+	 * dbrpcinit and dbrpcparam must be called must be called before each execution
+	 * instead of calling dbrpcparam in EXEC_PRE we trigger another event in exec, after calling dbrpcinit
+	 */
+	if (event_type == PDO_PARAM_EVT_EXEC_PRE && init_post) {
+		int status = 0;
+		long maxlen = -1;
+
+		if (P->retval) {
+			return 1;
 		}
 
-		if (FAIL == dbrpcparam(H->link, param_name, (BYTE)status, type, maxlen, datalen, (LPBYTE)value)) {
-			pdo_raise_impl_error(stmt->dbh, stmt, "HY000", "PDO_DBLIB: RPC: Unable to set parameter.");
+		if (P->output) {
+			status = DBRPCRETURN;
+			P->return_pos = rpc->return_count++;
+			maxlen = P->valuelen > 8000 ? P->valuelen : 8000;
+		}
 
-			/* dbrpcinit has been called / need to reset it */
-			dbrpcinit(H->link, "", DBRPCRESET);
+		if (FAIL == dbrpcparam(H->link, param_name, (BYTE)status, P->type, maxlen, P->valuelen, P->value)) {
+			pdo_raise_impl_error(stmt->dbh, stmt, "HY000", "PDO_DBLIB: RPC: Unable to set parameter.");
 
 			return 0;
 		}
@@ -806,28 +810,157 @@ static int pdo_dblib_rpc_param_hook(pdo_stmt_t *stmt, struct pdo_bound_param_dat
 	return 1;
 };
 
-static int pdo_dblib_rpc_exec(pdo_stmt_t *stmt)
+static int pdo_dblib_rpc_execsql_prepare(pdo_stmt_t *stmt, struct pdo_bound_param_data *param)
+{
+	pdo_dblib_stmt *S = (pdo_dblib_stmt*)stmt->driver_data;
+	pdo_dblib_rpc_stmt *rpc = S->rpc;
+	pdo_dblib_param *P = (pdo_dblib_param*)param->driver_data;
+	zval *parameter;
+	char *name, *type, *buf;
+	size_t name_len, params_len, type_len, buf_len;
+	int sep;
+
+	if (P->retval) {
+		return 1;
+	}
+
+	if (param->paramno != -1) {
+		name_len = spprintf(&name, 10, "@%d", param->paramno + 1);
+	} else {
+		name = ZSTR_VAL(param->name);
+		name_len = ZSTR_LEN(param->name);
+	}
+
+	/* prepare string: ...,@param varchar(8000) */
+	switch(P->type) {
+		case SQLFLT8:
+			type = " float";
+			break;
+		case SQLINT8:
+			type = " int";
+			break;
+		case SQLBIT:
+			type = " bit";
+			break;
+		case SQLTEXT:
+			type = " text";
+			break;
+		default:
+			type = " varchar(8000)";
+	}
+
+	params_len = Z_STRLEN_P(rpc->params);
+	type_len = strlen(type) + 1;
+	buf_len = params_len + sep + name_len + type_len;
+	buf = emalloc(buf_len);
+	if (params_len) {
+		strncpy(buf, Z_STRVAL_P(rpc->params), params_len);
+		*(buf + params_len - 1) = ',';
+	}
+	strncpy(buf + params_len + sep, name, name_len);
+	strncpy(buf + params_len + sep + name_len, type, type_len);
+
+	ZVAL_STRINGL(rpc->params, buf, buf_len);
+
+	efree(buf);
+	if (param->paramno != -1) {
+		efree(name);
+	}
+
+	return 1;
+}
+
+static int pdo_dblib_rpc_execsql_bind(pdo_stmt_t *stmt)
+{
+	pdo_dblib_stmt *S = (pdo_dblib_stmt*)stmt->driver_data;
+	pdo_dblib_rpc_stmt *rpc = S->rpc;
+	struct pdo_bound_param_data *param;
+	struct pdo_bound_param_data execprm;
+	pdo_dblib_param execprm_data;
+
+	/* init temp param */
+	memset(&execprm, 0, sizeof(execprm));
+	execprm.driver_data = &execprm_data;
+	execprm_data.type = SQLVARCHAR;
+	execprm_data.output = 0;
+	execprm_data.retval = 0;
+
+	/* bind "statement" */
+	execprm_data.value = (LPBYTE)stmt->query_string;
+	execprm_data.valuelen = stmt->query_stringlen;
+	if (!pdo_dblib_rpc_param_hook(stmt, &execprm, PDO_PARAM_EVT_EXEC_PRE, 1)) {
+		return 0;
+	}
+
+	/* prepare & bind "params" */
+	if (!stmt->bound_params) {
+		return 1;
+	}
+
+	ZVAL_STRING(rpc->params, "");
+	ZEND_HASH_FOREACH_PTR(stmt->bound_params, param) {
+		pdo_dblib_rpc_execsql_prepare(stmt, param);
+	} ZEND_HASH_FOREACH_END();
+
+	execprm_data.value = (LPBYTE)Z_STRVAL_P(rpc->params);
+	execprm_data.valuelen = Z_STRLEN_P(rpc->params);
+	if (!pdo_dblib_rpc_param_hook(stmt, &execprm, PDO_PARAM_EVT_EXEC_PRE, 1)) {
+		return 0;
+	}
+
+	return 1;
+}
+
+static int pdo_dblib_rpc_param_cmp(const void* a, const void* b)
+{
+	/* sort by paramno, pushing -1 at the end */
+	int a_no = ((struct pdo_bound_param_data *)Z_PTR(((Bucket *)a)->val))->paramno;
+	int b_no = ((struct pdo_bound_param_data *)Z_PTR(((Bucket *)b)->val))->paramno;
+
+	if (a_no == b_no) return 0;
+	if (a_no == -1) return 1;
+	if (b_no == -1) return -1;
+	if (a_no < b_no) return -1;
+	return 1;
+}
+
+static int pdo_dblib_rpc_execute(pdo_stmt_t *stmt)
 {
 	pdo_dblib_stmt *S = (pdo_dblib_stmt*)stmt->driver_data;
 	pdo_dblib_db_handle *H = S->H;
 	pdo_dblib_rpc_stmt *rpc = S->rpc;
 	RETCODE ret;
+	struct pdo_bound_param_data *param;
+	char *sql = stmt->query_string;
+
+	if (rpc->execsql) {
+		sql = "sp_executesql";
+	}
 
 	/* rpc init */
-	if (FAIL == dbrpcinit(H->link, stmt->query_string, 0)) {
+	/* need to call DBRPCRESET on error before dbrpcexec */
+	if (FAIL == dbrpcinit(H->link, sql, 0)) {
 		pdo_raise_impl_error(stmt->dbh, stmt, "HY000", "PDO_DBLIB: RPC: Unable to init.");
 		return 0;
 	}
 
-	/* rpc bind via INIT_POST */
+	/* sort params */
+	if (stmt->bound_params) {
+		zend_hash_sort(stmt->bound_params, pdo_dblib_rpc_param_cmp, 0);
+	}
+
+	/* bind execsql auto params */
+	if (rpc->execsql && !pdo_dblib_rpc_execsql_bind(stmt)) {
+		dbrpcinit(H->link, "", DBRPCRESET);
+		return 0;
+	}
+
+	/* rpc bind */
 	rpc->return_count = 0;
 	if (stmt->bound_params) {
-		struct pdo_bound_param_data *param;
-
-		zend_hash_sort(stmt->bound_params, pdo_dblib_rpc_param_cmp, 0);
-
 		ZEND_HASH_FOREACH_PTR(stmt->bound_params, param) {
 			if (!pdo_dblib_rpc_param_hook(stmt, param, PDO_PARAM_EVT_EXEC_PRE, 1)) {
+				dbrpcinit(H->link, "", DBRPCRESET);
 				return 0;
 			}
 		} ZEND_HASH_FOREACH_END();
@@ -849,10 +982,7 @@ static int pdo_dblib_rpc_exec(pdo_stmt_t *stmt)
 static int pdo_dblib_stmt_param_hook(pdo_stmt_t *stmt, struct pdo_bound_param_data *param,
 	enum pdo_param_event event_type)
 {
-	if (
-		event_type == PDO_PARAM_EVT_EXEC_PRE ||
-		event_type == PDO_PARAM_EVT_FETCH_PRE
-	) {
+	if (event_type == PDO_PARAM_EVT_FETCH_PRE) {
 		return 1;
 	}
 
