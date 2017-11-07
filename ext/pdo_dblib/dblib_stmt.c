@@ -326,11 +326,13 @@ static int pdo_dblib_stmt_get_col(pdo_stmt_t *stmt, int colno, char **ptr,
 		if (pdo_dblib_stmt_stringify_col(stmt, coltype) && dbwillconvert(coltype, SQLCHAR)) {
 			tmp_data_len = 32 + (2 * (data_len)); /* FIXME: We allocate more than we need here */
 			tmp_data = emalloc(tmp_data_len);
-			data_len = dbconvert(NULL, coltype, data, data_len, SQLCHAR, (LPBYTE) tmp_data, -1);
-
-			zv = emalloc(sizeof(zval));
-			ZVAL_STRING(zv, tmp_data);
-
+			tmp_data_len = dbconvert(NULL, coltype, data, data_len, SQLCHAR, (LPBYTE) tmp_data, tmp_data_len);
+			if (tmp_data_len == (unsigned int) -1) { /* in case tmp_data_len wasn't enough */
+				pdo_raise_impl_error(stmt->dbh, stmt, "HY000", "PDO_DBLIB: dbconvert() error");
+			} else {
+				zv = emalloc(sizeof(zval));
+				ZVAL_STRING(zv, tmp_data);
+			}
 			efree(tmp_data);
 		}
 
