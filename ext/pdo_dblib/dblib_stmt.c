@@ -456,8 +456,11 @@ static int pdo_dblib_stmt_get_col(pdo_stmt_t *stmt, int colno, char **ptr,
 				case SQLMONEY:
 				case SQLMONEY4:
 				case SQLMONEYN: {
-					DBFLT8 float_value;
-					dbconvert(NULL, coltype, data, 8, SQLFLT8, (LPBYTE) &float_value, -1);
+					tmp_data_len = 77;	//tds MAXPRECISION
+					tmp_data = safe_emalloc(tmp_data_len, sizeof(char), 1);
+					data_len = dbconvert(NULL, coltype, data, 8, SQLCHAR, (LPBYTE) tmp_data, tmp_data_len);
+					double float_value = zend_strtod(tmp_data, (const char **) NULL);
+					efree(tmp_data);
 
 					zv = emalloc(sizeof(zval));
 					ZVAL_DOUBLE(zv, float_value);
